@@ -10,6 +10,7 @@
 //                       built from (build-windows.sh; ignored here)
 //   soc=mt7981          SoC: mt7981 (default) or mt7986, the machine is
 //                       <soc>-router
+//   led1=...            front panel LEDs (see Leds.cs), also machine options
 //   key=value           every other key is a machine option
 //                       (gmac0, gmac1, ports, nand, ddr, usb-port, ...)
 
@@ -203,6 +204,7 @@ namespace RouterEmulator
         TextBox lanIp, lanFwd, efuseFile, efuseUid, nandUid;
         ComboBox poweroff;
         CheckBox autoDesc;
+        ListBox ledList;
 
         static readonly string[] PortIds = { "wan", "lan1", "lan2", "lan3", "lan4", "-" };
         // keys written by the editor (dropped when not applicable)
@@ -360,6 +362,50 @@ namespace RouterEmulator
                 Text = L.T("ed.identity_hint", "eFuse dump of a real board (/sys/bus/nvmem/devices/nvmem0/nvmem); "
                     + "UIDs: 32 hex digits, make several emulated boards different. "
                     + "Vendor firmware may check the NAND UID.") });
+            // front panel LEDs (shown above the router console)
+            var lp = Page(tabs, L.T("ed.tab_leds", "LEDs"));
+            lp.Controls.Add(new Label { Left = 10, Top = 3, Width = 590, Height = 16, ForeColor = Color.DimGray,
+                Text = L.T("ed.leds_hint", "Shown above the router console. Presets of OpenWrt boards: "
+                    + "tools/dts-leds.py fills them from the device tree.") });
+            ledList = new ListBox { Left = 10, Top = 22, Width = 480, Height = 270, IntegralHeight = false,
+                HorizontalScrollbar = true };
+            lp.Controls.Add(ledList);
+            var ledAdd = new Button { Left = 500, Top = 22, Width = 100, Height = 26, Text = L.T("ed.led_add", "Add...") };
+            var ledEdit = new Button { Left = 500, Top = 52, Width = 100, Height = 26, Text = L.T("ed.led_edit", "Edit...") };
+            var ledDel = new Button { Left = 500, Top = 82, Width = 100, Height = 26, Text = L.T("ed.led_delete", "Delete") };
+            var ledUp = new Button { Left = 500, Top = 122, Width = 100, Height = 26, Text = L.T("ed.led_up", "Up") };
+            var ledDown = new Button { Left = 500, Top = 152, Width = 100, Height = 26, Text = L.T("ed.led_down", "Down") };
+            lp.Controls.AddRange(new Control[] { ledAdd, ledEdit, ledDel, ledUp, ledDown });
+            Action edit = () => {
+                var cur = ledList.SelectedItem as LedDef;
+                if (cur == null) return;
+                using (var f = new LedEditForm(cur)) {
+                    if (f.ShowDialog(this) == DialogResult.OK) ledList.Items[ledList.SelectedIndex] = f.Result;
+                }
+            };
+            ledAdd.Click += delegate {
+                using (var f = new LedEditForm(null)) {
+                    if (f.ShowDialog(this) == DialogResult.OK) ledList.SelectedIndex = ledList.Items.Add(f.Result);
+                }
+            };
+            ledEdit.Click += delegate { edit(); };
+            ledList.DoubleClick += delegate { edit(); };
+            ledDel.Click += delegate {
+                int i = ledList.SelectedIndex;
+                if (i < 0) return;
+                ledList.Items.RemoveAt(i);
+                if (ledList.Items.Count > 0) ledList.SelectedIndex = Math.Min(i, ledList.Items.Count - 1);
+            };
+            EventHandler move = (o, e) => {
+                int i = ledList.SelectedIndex, j = i + (o == ledUp ? -1 : 1);
+                if (i < 0 || j < 0 || j >= ledList.Items.Count) return;
+                var it = ledList.Items[i];
+                ledList.Items.RemoveAt(i);
+                ledList.Items.Insert(j, it);
+                ledList.SelectedIndex = j;
+            };
+            ledUp.Click += move;
+            ledDown.Click += move;
             y += tabs.Height + 8;
 
             var acc = new GroupBox { Left = 10, Top = y, Width = 620, Height = 90,
@@ -534,6 +580,8 @@ namespace RouterEmulator
             efuseFile.Text = p.Get("efuse");
             efuseUid.Text = p.Get("efuse-uid");
             nandUid.Text = p.Get("nand-uid");
+            ledList.Items.Clear();
+            foreach (var d in LedDef.FromPreset(p)) ledList.Items.Add(d);
         }
 
         void UpdateEnabled()
@@ -673,8 +721,10 @@ namespace RouterEmulator
             // keep keys this editor does not know (openwrt=..., new options)
             if (preset != null) {
                 foreach (var kv in preset.Values)
-                    if (p.Get(kv.Key, null) == null && !Known.Contains(kv.Key)) p.Set(kv.Key, kv.Value);
+                    if (p.Get(kv.Key, null) == null && !Known.Contains(kv.Key) && !LedDef.IsKey(kv.Key))
+                        p.Set(kv.Key, kv.Value);
             }
+            for (int i = 0; i < ledList.Items.Count; i++) p.Set("led" + (i + 1), ledList.Items[i].ToString());
             return p;
         }
 

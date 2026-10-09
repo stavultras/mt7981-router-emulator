@@ -9,7 +9,7 @@
 //
 // Build: see build-windows.sh (mcs against the .NET Framework 4.8
 // reference assemblies), or with csc.exe on Windows:
-//   csc -target:winexe -out:emulator.exe Launcher.cs Presets.cs Terminal.cs
+//   csc -target:winexe -out:emulator.exe Launcher.cs Presets.cs Lang.cs Terminal.cs Leds.cs Version.cs
 
 using System;
 using System.Collections.Generic;
@@ -467,6 +467,9 @@ namespace RouterEmulator
 
             qmpPort = FreePort();
             int conPort = FreePort();
+            // the LED panel polls QEMU on a QMP socket of its own
+            var ledDefs = LedDef.FromPreset(b);
+            int ledPort = ledDefs.Count > 0 ? FreePort() : 0;
             // serial console (+ QEMU monitor via Ctrl-A C) on a local socket,
             // shown in the built-in terminal; QEMU waits until it connects
             var args = new List<string> {
@@ -480,6 +483,10 @@ namespace RouterEmulator
                 "-serial", "chardev:con",
                 "-mon", "chardev=con",
             };
+            if (ledPort != 0) {
+                args.Add("-qmp");
+                args.Add("tcp:127.0.0.1:" + ledPort + ",server=on,wait=off");
+            }
             ConsoleLog log = null;
             string logPath = null;
             if (useLogs.Checked) {
@@ -536,7 +543,7 @@ namespace RouterEmulator
             }
 
             if (term != null && !term.IsDisposed) { term.AskClose = null; term.Close(); }
-            term = new TerminalForm(b.Name);
+            term = new TerminalForm(b.Name, ledDefs);
             term.Log = log;
             term.AskClose = () => {
                 if (qemu == null || qemu.HasExited) return true;
@@ -548,6 +555,7 @@ namespace RouterEmulator
             term.Show();
             var proc = qemu;
             term.Connect(conPort, () => !proc.HasExited);
+            if (ledPort != 0) term.StartLeds(ledPort, () => !proc.HasExited);
 
             SaveCfg();
             SetRunning(true);

@@ -41,7 +41,8 @@
 #   -L DIR         console log folder (default: ./logs, "-L none" disables);
 #                  every start writes console_YYYY-MM-DD_HH-MM-SS.log
 #   -m MONITOR     QEMU monitor socket path (default: ./work/monitor.sock)
-#   -g             print GPIO/LED changes
+#   -g             print GPIO changes and the front panel LEDs of the preset
+#                  ("LED Status: white on"; preset keys led1=...)
 #   -R             power on with reset held 10 s (U-Boot TFTP recovery:
 #                  OpenWrt U-Boot asks 192.168.1.254, some vendor
 #                  bootloaders 192.168.1.88)

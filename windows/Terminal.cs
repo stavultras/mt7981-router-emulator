@@ -623,8 +623,10 @@ namespace RouterEmulator
 
         readonly StatusStrip bar = new StatusStrip { SizingGrip = true };
         readonly ToolStripStatusLabel sizeLabel = new ToolStripStatusLabel();
+        readonly LedPanel leds = new LedPanel();
+        readonly LedPoller ledPoller = new LedPoller();
 
-        public TerminalForm(string title)
+        public TerminalForm(string title, List<LedDef> ledDefs = null)
         {
             Text = title + " - serial console (select = copy, right click = paste)";
             FormBorderStyle = FormBorderStyle.Sizable;
@@ -641,9 +643,17 @@ namespace RouterEmulator
             Size cells = term.TermSize;
             Controls.Add(term);
             Controls.Add(bar);
+            // front panel LEDs of the preset above the console
+            leds.Width = cells.Width;
+            leds.SetLeds(ledDefs ?? new List<LedDef>());
+            if (leds.HasLeds) {
+                Controls.Add(leds);
+                leds.Dock = DockStyle.Top;
+            }
             term.Dock = DockStyle.Fill;
             // the status bar's real height is known only once it is on the form
-            ClientSize = new Size(cells.Width, cells.Height + bar.GetPreferredSize(Size.Empty).Height);
+            ClientSize = new Size(cells.Width, cells.Height + bar.GetPreferredSize(Size.Empty).Height
+                                  + (leds.HasLeds ? leds.Height : 0));
             MinimumSize = new Size(300, 200);
             UpdateSizeLabel();
             term.SizeChanged2 += UpdateSizeLabel;
@@ -660,6 +670,7 @@ namespace RouterEmulator
             FormClosing += (o, e) => {
                 if (AskClose != null && !AskClose()) { e.Cancel = true; return; }
                 closing = true;
+                ledPoller.Stop();
                 try { if (client != null) client.Close(); } catch (Exception) { }
                 if (Log != null) Log.Dispose();
             };
@@ -717,6 +728,16 @@ namespace RouterEmulator
         {
             if (IsDisposed) return;
             BeginInvoke(new Action(() => term.Write(s)));
+        }
+
+        // LED states from QEMU's QMP socket "port" while alive()
+        public void StartLeds(int port, Func<bool> alive)
+        {
+            if (!leds.HasLeds) return;
+            ledPoller.Start(port, () => alive() && !closing, st => {
+                if (IsDisposed || closing) return;
+                try { BeginInvoke(new Action(() => leds.SetState(st))); } catch (Exception) { }
+            });
         }
 
         // Connect to QEMU's serial socket (retrying while QEMU starts) and pump data.

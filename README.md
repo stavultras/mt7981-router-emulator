@@ -68,10 +68,25 @@ or use dumps of a real router.
 | `reset-active-high`, `wps-active-high` | `on` | button reads 1 when pressed (default: active low) |
 | `reset-hold` | ms | power on with reset held (U-Boot TFTP recovery) |
 | `poweroff` | `stop` · `reboot` | `stop` (default): the emulator ends when Linux powers off ("reboot: Power down" on UART0); `reboot`: like a real board, whose firmware cannot power down |
-| `gpio-log` | `on` | print GPIO output changes (LEDs) |
+| `gpio-log` | `on` | print GPIO output changes and the LEDs' states |
+| `led1` … `led32` | `NAME: COLOUR SOURCE [+ COLOUR SOURCE…]` | front panel LEDs (see below); `led-state` (QOM `/machine`) returns their states |
 | `efuse` | file | load the eFuse contents from a dump of a real board (up to 4 KiB, as read from `/sys/bus/nvmem/devices/nvmem0/nvmem`), so calibration and chip data match that board |
 | `efuse-uid` | 32 hex digits | set the per-chip unique block, so several emulated boards are not identical |
 | `nand-uid` | 32 hex digits | SPI-NAND unique ID (default: derived from the flash folder name); stock Cudy firmware checks the NAND unique ID, without it login is disabled |
+
+Front panel LEDs: `led1=Status: red gpio:11:low + white gpio:10:low` is
+one lamp with two colours, each on its own GPIO (`:low` = GPIO_ACTIVE_LOW).
+Sources: `gpio:N[:low]` (SoC GPIO), `phy:ADDR:N` (LED pin N of the
+Ethernet PHY at MDIO address ADDR, as its LED registers program it:
+RTL8221B, GPY211; e.g. the WR3000P WAN lamp in current OpenWrt),
+`ws2812:BUS:N` (WS2812B RGB chain on SPI bus BUS, colour `rgb`: Redmi
+AX6000) and `pwm:N` (PWM channel, pwm-leds: BPi-R4 Lite). QEMU samples them
+every 50 ms; `qom-get /machine led-state` gives per LED (`;`) and colour
+(`,`) `0`, `1`, `b` (blinking) or `#rrggbb` / `b#rrggbb`. The Windows
+launcher shows them as a row of lamps above the console; with `-g`
+(`gpio-log=on`) QEMU prints every change ("LED Status: white on").
+[`tools/dts-leds.py`](tools/dts-leds.py) fills the `led` keys of the
+presets from the OpenWrt device tree (`--write --all`).
 
 Network ports are QEMU netdevs with the ids used above (`wan`, `lan1`, …).
 Launcher-only preset keys: `lan-ip` (router LAN address, default
@@ -221,6 +236,7 @@ All device models live in `hw/arm/mt7981/` of the QEMU tree
 | Switch | `mt7981_eth.c` | MT7531: paged MDIO access, internal PHY indirect access, MTK special tag (DSA), learning FDB, port matrix, link IRQ → EINT 38 |
 | PHYs | `mt7981_eth.c` | MT7531 GPHY ×5; RTL8221B-VB-CG (C45, temperature sensor); Motorcomm YT8821 (extended registers, UTP/SerDes spaces, 2.5G status); MaxLinear GPY211C (C45, firmware version, mailbox, temperature sensor); MT7981 built-in GbE PHY (calibration handshake); a PHY on MT7531 port 5; optional hardware reset GPIOs |
 | GPIO / EINT | `mt7981_pinctrl.c` | buttons (reset/WPS, `reset-hold-ms` for timed presses), LED log, pad levels to board devices |
+| LEDs | `mt7981_leds.c`, `ws2812b.c` | front panel LEDs from the preset: GPIO, PHY LED registers (RTL8221B, GPY211), WS2812B on SPI, PWM channels; blinking detection; `led-state` |
 | USB | QEMU xHCI + MTK IPPC | USB 2.0 / 3.0 connector |
 | Wi-Fi | `mt7981_wmac.c` | WFDMA rings + emulated WM/WA firmware command interface: firmware loads, both bands come up, hostapd runs, nothing is on the air (scans are empty) |
 | PCIe (MT7987) | `mt7987_pcie.c` | MediaTek Gen3 host: link, CFGNUM configuration TLPs, INTx, MSI capture, with QEMU's PCIe root port |
@@ -260,7 +276,7 @@ Linux: [`emulator.sh`](emulator.sh) — `-P PRESET` (`-P list`), `-o OPTS`
 (`offline` = user-mode WAN with `restrict=on`: DHCP works, nothing leaves the PC),
 `-l isolated|nic|user|none` (`user` = this PC only, forwards from the
 preset), `-p "1 3"` (LAN ports), `-u DIR` (USB stick from a
-folder, FAT16), `-L DIR` (console logs), `-g` (GPIO log), `-R` (power on
+folder, FAT16), `-L DIR` (console logs), `-g` (GPIO and LED log), `-R` (power on
 with reset held 10 s → TFTP recovery), `-d` (unimplemented register log),
 `-S SOCK` (headless: console on a unix socket, for scripts and CI;
 `socat -,raw,echo=0,escape=0x1d UNIX-CONNECT:SOCK` to attach). `WAN_EXTRA` /

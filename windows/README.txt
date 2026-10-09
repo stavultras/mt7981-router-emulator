@@ -55,6 +55,14 @@ A preset (presets\*.ini) describes the hardware:
               eFuse dump of a real board and per-chip eFuse / NAND unique
               IDs (32 hex digits, "Random" button); empty = defaults.
               Vendor firmware may check the NAND UID.
+  LEDs       front panel lamps shown above the router console: name and
+              one or more colours, each driven by a GPIO ("active low" =
+              lit while the GPIO is 0), an LED pin of an Ethernet PHY
+              (MDIO address + LED number, e.g. the WR3000P WAN lamp in
+              current OpenWrt), a WS2812B RGB LED on SPI or a PWM channel.
+              A two-colour status lamp (red / white) has two rows. The
+              included presets have them from the OpenWrt device tree;
+              hover over a lamp to see its source
   On poweroff turn the emulator off (default) or reboot like the hardware
   Access from this PC
               router LAN IP (default 192.168.1.1) and port forwards for

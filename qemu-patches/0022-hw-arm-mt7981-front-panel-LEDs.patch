@@ -1,0 +1,848 @@
+From f27cf860b72eccf93ec96a00578e81cfd57021f8 Mon Sep 17 00:00:00 2001
+From: Dmitry Mostovoy <stavultras@gmail.com>
+Date: Fri, 9 Oct 2026 12:40:53 -0400
+Subject: [PATCH 22/22] hw/arm/mt7981: front panel LEDs
+
+Machine options led1..led32 describe the board's LEDs:
+"<name>: <colour> <source> [+ <colour> <source>...]", several colours
+of one lamp joined with "+".  Sources: gpio:N[:low] (SoC GPIO),
+phy:ADDR:N (LED pin of the Ethernet PHY at an MDIO address, from its LED
+registers: RTL8221B 0xd032.. / 0xd040 / 0xd044, GPY211 PHY_LED and
+VSPEC1_LED), ws2812:BUS:N (a WS2812B chain on a SPI bus, decoded from the
+leds-ws2812b bit stream) and pwm:N (PWM controller channel, enable bit and
+duty).  Every 50 ms the sources are sampled; several level changes within
+200 ms count as blinking.  "led-state" (qom-get /machine) returns the
+states for the launcher's LED panel, gpio-log=on prints the changes.
+
+Works on MT7981, MT7986 and MT7987 (PWM channel blocks per SoC).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/mt7981/meson.build      |   2 +
+ hw/arm/mt7981/mt7981.h         |  10 ++
+ hw/arm/mt7981/mt7981_eth.c     |  68 ++++++++
+ hw/arm/mt7981/mt7981_leds.c    | 290 +++++++++++++++++++++++++++++++++
+ hw/arm/mt7981/mt7981_leds.h    |  27 +++
+ hw/arm/mt7981/mt7981_pinctrl.c |  20 +++
+ hw/arm/mt7981/mt7981_router.c  |  68 +++++++-
+ hw/arm/mt7981/mt7981_sysctl.c  |   8 +
+ hw/arm/mt7981/ws2812b.c        | 150 +++++++++++++++++
+ 9 files changed, 642 insertions(+), 1 deletion(-)
+ create mode 100644 hw/arm/mt7981/mt7981_leds.c
+ create mode 100644 hw/arm/mt7981/mt7981_leds.h
+ create mode 100644 hw/arm/mt7981/ws2812b.c
+
+diff --git a/hw/arm/mt7981/meson.build b/hw/arm/mt7981/meson.build
+index 7797ce9..7722300 100644
+--- a/hw/arm/mt7981/meson.build
++++ b/hw/arm/mt7981/meson.build
+@@ -11,4 +11,6 @@ arm_common_ss.add(when: 'CONFIG_MT7981', if_true: files(
+   'mt7981_msdc.c',
+   'mt7987_pcie.c',
+   'mt7992_wifi.c',
++  'mt7981_leds.c',
++  'ws2812b.c',
+ ))
+diff --git a/hw/arm/mt7981/mt7981.h b/hw/arm/mt7981/mt7981.h
+index 209e09a..6b119e2 100644
+--- a/hw/arm/mt7981/mt7981.h
++++ b/hw/arm/mt7981/mt7981.h
+@@ -104,6 +104,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7981PinctrlState, MT7981_PINCTRL)
+ #define TYPE_MT7981_WMAC "mt7981-wmac"
+ OBJECT_DECLARE_SIMPLE_TYPE(MT7981WmacState, MT7981_WMAC)
+ 
++/* LED panel (mt7981_leds.c): state of the LED sources */
++int mt7981_pinctrl_out(DeviceState *dev, int pin, uint32_t *toggles);
++int mt7981_eth_phy_led(DeviceState *dev, int addr, int idx, uint32_t *frames);
++uint32_t mt7981_sysctl_peek(DeviceState *dev, hwaddr a);
++
++/* WS2812B RGB LED chain on a SPI bus (decodes the leds-ws2812b stream) */
++#define TYPE_WS2812B_SPI "ws2812b-spi"
++bool ws2812b_get(DeviceState *dev, int idx, uint8_t rgb[3], uint8_t lit[3],
++                 uint32_t *changes);
++
+ /* hook so the sysctl block can power on secondary cores */
+ void mt7981_cpu_power_on(int cpu, uint64_t entry);
+ 
+diff --git a/hw/arm/mt7981/mt7981_eth.c b/hw/arm/mt7981/mt7981_eth.c
+index 6176514..d5f1d86 100644
+--- a/hw/arm/mt7981/mt7981_eth.c
++++ b/hw/arm/mt7981/mt7981_eth.c
+@@ -188,6 +188,7 @@ struct MT7981EthState {
+     uint32_t p5phy_addr;
+ 
+     EthPort ports[8];
++    uint32_t frames[8];         /* frames through each port (LED activity) */
+     uint8_t *txbuf;
+     int tx_mask;        /* special tag port mask of the frame being sent */
+ };
+@@ -801,6 +802,69 @@ static EthPhy *mdio_find_phy(MT7981EthState *s, int addr, bool sw_internal)
+     return NULL;
+ }
+ 
++/*
++ * LED pin idx of the external PHY at MDIO address addr, as its LED
++ * registers program it: -1 = no such PHY (or LED), else bit 0 = lit,
++ * bit 1 = blinks with traffic.  *frames counts the frames of its port.
++ */
++int mt7981_eth_phy_led(DeviceState *dev, int addr, int idx, uint32_t *frames)
++{
++    MT7981EthState *s = MT7981_ETH(dev);
++    EthPhy *p = NULL;
++    int port = -1;
++    uint32_t ctl, act;
++    bool on;
++
++    for (int g = 0; g < 2; g++) {
++        if (s->dphy_type[g] && addr == s->dphy_addr[g]) {
++            p = &s->dphy[g];
++            port = 5 + g;
++        }
++    }
++    if (!p && s->p5phy_type && addr == s->p5phy_addr) {
++        p = &s->p5phy;
++        port = 7;
++    }
++    if (!p || idx < 0 || idx > 3) {
++        return -1;
++    }
++    *frames = s->frames[port];
++    if (p->in_reset) {
++        return 0;
++    }
++    switch (p->type) {
++    case PHY_RTL8221B:
++        /*
++         * VEND2 0xd032 + 2n: link speeds that light LED n (bit 5 = 2.5G,
++         * the link here), 0xd040 bit n: blink on traffic, 0xd044 bit n:
++         * inverted (the driver's "always on": no speeds + inverted)
++         */
++        ctl = ht_get(p->mmd, (31 << 16) | (0xd032 + 2 * idx), 0);
++        act = ht_get(p->mmd, (31 << 16) | 0xd040, 0) & BIT(idx);
++        on = p->link && (ctl & BIT(5));
++        if (ht_get(p->mmd, (31 << 16) | 0xd044, 0) & BIT(idx)) {
++            on = !on;
++        }
++        return on | ((on && act) ? 2 : 0);
++    case PHY_GPY211:
++        /*
++         * PHY_LED (0x1b): bit 8+n hardware control, else bit n = on;
++         * VSPEC1_LED(n) (VEND1 1+n): [7:4] link speeds (bit 3 = 2.5G),
++         * [11:8] pulse on TX/RX
++         */
++        ctl = p->c22[0x1b];
++        if (!(ctl & BIT(8 + idx))) {
++            return !!(ctl & BIT(idx));
++        }
++        ctl = ht_get(p->mmd, (30 << 16) | (1 + idx), 0);
++        on = p->link && (ctl & BIT(4 + 3));
++        return on | ((on && (ctl & (3 << 8))) ? 2 : 0);
++    default:
++        /* no LED registers modelled: lit while the link is up */
++        return p->link | (p->link ? 2 : 0);
++    }
++}
++
+ static uint32_t mdio_iac(MT7981EthState *s, uint32_t v, bool sw_internal)
+ {
+     int reg = (v >> 25) & 0x1f;   /* c45: device */
+@@ -919,8 +983,10 @@ static void sw_egress(MT7981EthState *s, int src, int dst,
+         return;
+     }
+     if (dst < SW_NPHY && s->gphy[dst].link && s->ports[dst].nic) {
++        s->frames[dst]++;
+         qemu_send_packet(qemu_get_queue(s->ports[dst].nic), buf, len);
+     } else if (dst == 5 && s->p5phy_type && s->p5phy.link && s->ports[7].nic) {
++        s->frames[7]++;
+         qemu_send_packet(qemu_get_queue(s->ports[7].nic), buf, len);
+     }
+ }
+@@ -1197,6 +1263,7 @@ static void gmac_out(MT7981EthState *s, int gdm, uint8_t *f, size_t len)
+     if (gdm == 0 && s->has_switch) {
+         sw_cpu_deliver(s, s->tx_mask, f, len);
+     } else if (s->dphy_type[gdm] && s->dphy[gdm].link && s->ports[5 + gdm].nic) {
++        s->frames[5 + gdm]++;
+         qemu_send_packet(qemu_get_queue(s->ports[5 + gdm].nic), f, len);
+     }
+ }
+@@ -1671,6 +1738,7 @@ static ssize_t port_receive(NetClientState *nc, const uint8_t *buf,
+         buf = pad;
+         size = 60;
+     }
++    s->frames[p->index]++;
+     if (p->index == 7) {
+         if (s->p5phy.link) {
+             sw_forward(s, 5, buf, size);
+diff --git a/hw/arm/mt7981/mt7981_leds.c b/hw/arm/mt7981/mt7981_leds.c
+new file mode 100644
+index 0000000..531f0d1
+--- /dev/null
++++ b/hw/arm/mt7981/mt7981_leds.c
+@@ -0,0 +1,290 @@
++/*
++ * Front panel LEDs of the emulated board (machine options led1..ledN):
++ *
++ *   ledN=<name>: <colour> <source> [+ <colour> <source>...]
++ *
++ * sources  gpio:N[:low]   SoC GPIO, lit while driven high (low: low)
++ *          phy:ADDR:N     LED pin N of the Ethernet PHY at MDIO address
++ *                         ADDR, as its LED registers program it
++ *          ws2812:BUS:N   LED N of a WS2812B chain on SPI bus BUS
++ *          pwm:N          PWM channel N (lit while enabled with a duty)
++ *
++ * Several colours of one lamp (bi-colour status LEDs) are joined with "+".
++ * Every 50 ms the sources are sampled; the machine property "led-state"
++ * (qom-get /machine led-state) returns one entry per LED, ';' separated,
++ * of one value per colour, ',' separated: 0 off, 1 on, b blinking, or
++ * for a WS2812B #rrggbb, b#rrggbb blinking in that colour.  With
++ * gpio-log=on the changes are printed.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/cutils.h"
++#include "qemu/timer.h"
++#include "qemu/error-report.h"
++#include "qapi/error.h"
++#include "hw/qdev-core.h"
++#include "hw/ssi/ssi.h"
++#include "mt7981.h"
++#include "mt7981_leds.h"
++
++#define TICK_MS     50
++#define WINDOW      4           /* ticks: 200 ms decide "blinking" */
++
++enum { SRC_GPIO, SRC_PHY, SRC_WS2812, SRC_PWM };
++
++typedef struct LedChan {
++    char *color;
++    int src;
++    int a, b;                   /* pin / MDIO address / bus / channel; LED */
++    bool low;
++    uint32_t last;              /* toggles / frames at the previous tick */
++    uint8_t hist[WINDOW];       /* changes per tick */
++    char state[12];
++} LedChan;
++
++typedef struct Led {
++    char *name;
++    LedChan ch[4];
++    int nch;
++    char *logged;
++} Led;
++
++struct RouterLeds {
++    RouterLedsHw hw;
++    Led *led;
++    int n;
++    int tick;
++    bool log;
++    DeviceState *ws[3];
++    QEMUTimer *timer;
++};
++
++static bool parse_chan(LedChan *c, const char *text, int nspi, Error **errp)
++{
++    g_auto(GStrv) w = g_strsplit_set(g_strstrip(g_strdup(text)), " \t", -1);
++    g_auto(GStrv) f = NULL;
++    int nw = 0, nf;
++    char *words[2];
++
++    for (int i = 0; w[i]; i++) {
++        if (*w[i]) {
++            if (nw == 2) {
++                goto bad;
++            }
++            words[nw++] = w[i];
++        }
++    }
++    if (nw != 2) {
++        goto bad;
++    }
++    c->color = g_strdup(words[0]);
++    f = g_strsplit(words[1], ":", -1);
++    nf = g_strv_length(f);
++    if (!strcmp(f[0], "gpio") &&
++        (nf == 2 || (nf == 3 && !strcmp(f[2], "low")))) {
++        c->src = SRC_GPIO;
++        c->a = atoi(f[1]);
++        c->low = nf == 3;
++    } else if (!strcmp(f[0], "phy") && nf == 3) {
++        c->src = SRC_PHY;
++        c->a = atoi(f[1]);
++        c->b = atoi(f[2]);
++    } else if (!strcmp(f[0], "ws2812") && nf == 3) {
++        c->src = SRC_WS2812;
++        c->a = atoi(f[1]);
++        c->b = atoi(f[2]);
++        if (c->a < 0 || c->a >= nspi) {
++            error_setg(errp, "SPI%d does not exist (SPI0..SPI%d)", c->a,
++                       nspi - 1);
++            return false;
++        }
++    } else if (!strcmp(f[0], "pwm") && nf == 2) {
++        c->src = SRC_PWM;
++        c->a = atoi(f[1]);
++    } else {
++        goto bad;
++    }
++    return true;
++bad:
++    error_setg(errp, "\"%s\": expected <colour> gpio:N[:low] | phy:ADDR:N | "
++               "ws2812:BUS:N | pwm:N", text);
++    return false;
++}
++
++static bool parse_led(Led *l, const char *def, int nspi, Error **errp)
++{
++    const char *colon = strstr(def, ": ");
++    g_auto(GStrv) parts = NULL;
++
++    if (!colon) {
++        error_setg(errp, "\"%s\": expected <name>: <colour> <source>", def);
++        return false;
++    }
++    l->name = g_strstrip(g_strndup(def, colon - def));
++    parts = g_strsplit(colon + 2, "+", -1);
++    for (int i = 0; parts[i]; i++) {
++        if (l->nch == ARRAY_SIZE(l->ch)) {
++            error_setg(errp, "\"%s\": at most %d colours", def,
++                       (int)ARRAY_SIZE(l->ch));
++            return false;
++        }
++        if (!parse_chan(&l->ch[l->nch++], parts[i], nspi, errp)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/* record this tick's change count, return the changes of the window */
++static int window(RouterLeds *r, LedChan *c, uint32_t count)
++{
++    int sum = 0;
++
++    c->hist[r->tick % WINDOW] = MIN(count - c->last, 255);
++    c->last = count;
++    for (int i = 0; i < WINDOW; i++) {
++        sum += c->hist[i];
++    }
++    return sum;
++}
++
++static void sample(RouterLeds *r, LedChan *c)
++{
++    uint32_t count = 0;
++    int v;
++    uint8_t rgb[3], lit[3];
++
++    switch (c->src) {
++    case SRC_GPIO:
++        v = mt7981_pinctrl_out(r->hw.pinctrl, c->a, &count);
++        /* several level changes within 200 ms: a blinking trigger */
++        if (window(r, c, count) >= 3 && v >= 0) {
++            pstrcpy(c->state, sizeof(c->state), "b");
++        } else {
++            pstrcpy(c->state, sizeof(c->state),
++                    v < 0 ? "0" : (v ^ c->low) ? "1" : "0");
++        }
++        break;
++    case SRC_PHY:
++        v = r->hw.eth ? mt7981_eth_phy_led(r->hw.eth, c->a, c->b, &count) : -1;
++        if (v < 0) {
++            pstrcpy(c->state, sizeof(c->state), "0");
++            break;
++        }
++        /* traffic on a LED set to blink with it */
++        if (window(r, c, count) && (v & 2)) {
++            pstrcpy(c->state, sizeof(c->state), "b");
++        } else {
++            pstrcpy(c->state, sizeof(c->state), (v & 1) ? "1" : "0");
++        }
++        break;
++    case SRC_WS2812:
++        if (!r->ws[c->a] || !ws2812b_get(r->ws[c->a], c->b, rgb, lit, &count)) {
++            memset(rgb, 0, sizeof(rgb));
++        }
++        /* blinking: "b" and the colour it blinks in */
++        if (window(r, c, count) >= 3) {
++            snprintf(c->state, sizeof(c->state), "b#%02x%02x%02x",
++                     lit[0], lit[1], lit[2]);
++        } else {
++            snprintf(c->state, sizeof(c->state), "#%02x%02x%02x",
++                     rgb[0], rgb[1], rgb[2]);
++        }
++        break;
++    case SRC_PWM: {
++        /* enable bits at the base, PWMTHRES (duty) in the channel block */
++        hwaddr ch = r->hw.pwm_base + r->hw.pwm_chan_base +
++                    c->a * r->hw.pwm_chan_width;
++        bool on = (mt7981_sysctl_peek(r->hw.sysctl, r->hw.pwm_base) &
++                   BIT(c->a)) &&
++                  (mt7981_sysctl_peek(r->hw.sysctl, ch + 0x30) & 0x1fff);
++        pstrcpy(c->state, sizeof(c->state), on ? "1" : "0");
++        break;
++    }
++    }
++}
++
++static void leds_tick(void *opaque)
++{
++    RouterLeds *r = opaque;
++
++    r->tick++;
++    for (int i = 0; i < r->n; i++) {
++        Led *l = &r->led[i];
++        for (int k = 0; k < l->nch; k++) {
++            sample(r, &l->ch[k]);
++        }
++        if (r->log) {
++            GString *g = g_string_new(NULL);
++            for (int k = 0; k < l->nch; k++) {
++                const char *st = l->ch[k].state;
++                g_string_append_printf(g, "%s%s %s", k ? ", " : "",
++                    l->ch[k].color,
++                    !strcmp(st, "1") ? "on" : !strcmp(st, "0") ? "off" :
++                    !strcmp(st, "b") ? "blinking" : st);
++            }
++            if (!l->logged || strcmp(l->logged, g->str)) {
++                info_report("LED %s: %s", l->name, g->str);
++                g_free(l->logged);
++                l->logged = g_strdup(g->str);
++            }
++            g_string_free(g, true);
++        }
++    }
++    timer_mod(r->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + TICK_MS);
++}
++
++RouterLeds *router_leds_new(char **defs, int ndefs, const RouterLedsHw *hw,
++                            bool log, Error **errp)
++{
++    RouterLeds *r = g_new0(RouterLeds, 1);
++
++    r->hw = *hw;
++    r->log = log;
++    r->led = g_new0(Led, ndefs);
++    for (int i = 0; i < ndefs; i++) {
++        Error *err = NULL;
++        if (!defs[i] || !*defs[i]) {
++            continue;
++        }
++        if (!parse_led(&r->led[r->n], defs[i], hw->nspi, &err)) {
++            error_propagate_prepend(errp, err, "led%d: ", i + 1);
++            return NULL;
++        }
++        /* a WS2812B chain listens on its SPI bus */
++        for (int k = 0; k < r->led[r->n].nch; k++) {
++            LedChan *c = &r->led[r->n].ch[k];
++            if (c->src == SRC_WS2812 && !r->ws[c->a]) {
++                DeviceState *spi = hw->spi[c->a];
++                r->ws[c->a] = qdev_new(TYPE_WS2812B_SPI);
++                qdev_realize_and_unref(r->ws[c->a],
++                                       qdev_get_child_bus(spi, "spi"),
++                                       &error_fatal);
++                qdev_connect_gpio_out_named(spi, "cs", 0,
++                    qdev_get_gpio_in_named(r->ws[c->a], SSI_GPIO_CS, 0));
++            }
++        }
++        r->n++;
++    }
++    if (r->n) {
++        r->timer = timer_new_ms(QEMU_CLOCK_REALTIME, leds_tick, r);
++        timer_mod(r->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + TICK_MS);
++    }
++    return r;
++}
++
++char *router_leds_state(RouterLeds *r)
++{
++    GString *g = g_string_new(NULL);
++
++    for (int i = 0; r && i < r->n; i++) {
++        for (int k = 0; k < r->led[i].nch; k++) {
++            g_string_append_printf(g, "%s%s", k ? "," : (i ? ";" : ""),
++                                   r->led[i].ch[k].state[0] ?
++                                   r->led[i].ch[k].state : "0");
++        }
++    }
++    return g_string_free(g, false);
++}
+diff --git a/hw/arm/mt7981/mt7981_leds.h b/hw/arm/mt7981/mt7981_leds.h
+new file mode 100644
+index 0000000..9510982
+--- /dev/null
++++ b/hw/arm/mt7981/mt7981_leds.h
+@@ -0,0 +1,27 @@
++/*
++ * Front panel LEDs of the emulated board (see mt7981_leds.c)
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_ARM_MT7981_LEDS_H
++#define HW_ARM_MT7981_LEDS_H
++
++#include "hw/qdev-core.h"
++
++typedef struct RouterLedsHw {
++    DeviceState *pinctrl, *eth, *sysctl;
++    DeviceState *spi[3];        /* SPI masters (WS2812B chains) */
++    int nspi;
++    hwaddr pwm_base;            /* PWM controller */
++    hwaddr pwm_chan_base, pwm_chan_width;   /* its channel register blocks */
++} RouterLedsHw;
++
++typedef struct RouterLeds RouterLeds;
++
++RouterLeds *router_leds_new(char **defs, int ndefs, const RouterLedsHw *hw,
++                            bool log, Error **errp);
++/* "1,0;b;#ff0000": per LED, per colour (see mt7981_leds.c) */
++char *router_leds_state(RouterLeds *r);
++
++#endif
+diff --git a/hw/arm/mt7981/mt7981_pinctrl.c b/hw/arm/mt7981/mt7981_pinctrl.c
+index 47a6b6b..16e8ade 100644
+--- a/hw/arm/mt7981/mt7981_pinctrl.c
++++ b/hw/arm/mt7981/mt7981_pinctrl.c
+@@ -33,6 +33,7 @@ struct MT7981PinctrlState {
+     uint32_t bootstrap;         /* MT7987 boot strap register (gpio + 0x6f0) */
+     qemu_irq pin_out[MAX_PINS]; /* pad level as seen by board devices */
+     uint8_t pin_out_level[MAX_PINS];
++    uint32_t toggles[MAX_PINS]; /* level changes (LED panel: blinking) */
+ 
+     uint32_t dir[NWORDS], dout[NWORDS], mode[NMODE];
+     uint32_t ext_level[NWORDS];     /* level driven by board devices */
+@@ -69,11 +70,30 @@ static void pins_update(MT7981PinctrlState *s)
+         uint8_t lvl = (s->dir[w] & BIT(b)) ? !!(s->dout[w] & BIT(b)) : 1;
+         if (lvl != s->pin_out_level[pin]) {
+             s->pin_out_level[pin] = lvl;
++            s->toggles[pin]++;
+             qemu_set_irq(s->pin_out[pin], lvl);
+         }
+     }
+ }
+ 
++/*
++ * An LED on a pin: -1 while the pin is not driven (input, the LED stays
++ * dark), else the output level.  *toggles counts level changes.
++ */
++int mt7981_pinctrl_out(DeviceState *dev, int pin, uint32_t *toggles)
++{
++    MT7981PinctrlState *s = MT7981_PINCTRL(dev);
++
++    if (pin < 0 || pin >= (int)s->npins) {
++        return -1;
++    }
++    *toggles = s->toggles[pin];
++    if (!(s->dir[pin / 32] & BIT(pin % 32))) {
++        return -1;
++    }
++    return !!(s->dout[pin / 32] & BIT(pin % 32));
++}
++
+ static void eint_update(MT7981PinctrlState *s)
+ {
+     bool level = false;
+diff --git a/hw/arm/mt7981/mt7981_router.c b/hw/arm/mt7981/mt7981_router.c
+index d71a892..3e3ba15 100644
+--- a/hw/arm/mt7981/mt7981_router.c
++++ b/hw/arm/mt7981/mt7981_router.c
+@@ -42,8 +42,10 @@
+ #include "target/arm/arm-powerctl.h"
+ #include "net/net.h"
+ #include "mt7981.h"
++#include "mt7981_leds.h"
+ 
+ #define MAX_CPUS        4
++#define MAX_LEDS        32
+ #define DRAM_ALIAS_END  0xc0000000ULL   /* DRAM decoding wraps up to here */
+ 
+ /* what is attached to a GMAC */
+@@ -230,6 +232,11 @@ struct RouterState {
+     uint32_t usb;               /* 0 = none, 2 = USB 2.0, 3 = USB 3.0 */
+     uint32_t reset_gpio, wps_gpio;
+     bool reset_active_high, wps_active_high;
++
++    /* front panel LEDs (mt7981_leds.c) */
++    char *led_def[MAX_LEDS];
++    RouterLeds *leds;
++    DeviceState *sysctl;        /* generic registers (PWM controller) */
+ };
+ 
+ static bool router_get_reset_ah(Object *obj, Error **errp)
+@@ -274,6 +281,33 @@ static void router_set_gpio_log(Object *obj, bool value, Error **errp)
+     ROUTER_MACHINE(obj)->gpio_log = value;
+ }
+ 
++static void router_get_led(Object *obj, Visitor *v, const char *name,
++                           void *opaque, Error **errp)
++{
++    char *d = ROUTER_MACHINE(obj)->led_def[(uintptr_t)opaque];
++    char *value = g_strdup(d ? d : "");
++
++    visit_type_str(v, name, &value, errp);
++    g_free(value);
++}
++
++static void router_set_led(Object *obj, Visitor *v, const char *name,
++                           void *opaque, Error **errp)
++{
++    RouterState *b = ROUTER_MACHINE(obj);
++    char *value;
++
++    if (visit_type_str(v, name, &value, errp)) {
++        g_free(b->led_def[(uintptr_t)opaque]);
++        b->led_def[(uintptr_t)opaque] = value;
++    }
++}
++
++static char *router_get_led_state(Object *obj, Error **errp)
++{
++    return router_leds_state(ROUTER_MACHINE(obj)->leds);
++}
++
+ static char *router_get_pcie_wifi(Object *obj, Error **errp)
+ {
+     RouterState *b = ROUTER_MACHINE(obj);
+@@ -788,7 +822,7 @@ static void router_init(MachineState *machine)
+     RouterState *b = ROUTER_MACHINE(machine);
+     DeviceState *pinctrl;
+     MemoryRegion *sysmem = get_system_memory();
+-    DeviceState *dev, *spi[3];
++    DeviceState *dev, *spi[3] = { NULL };
+     DriveInfo *dinfo;
+     uint64_t ram_size = machine->ram_size;
+ 
+@@ -865,6 +899,7 @@ static void router_init(MachineState *machine)
+         qdev_prop_set_string(dev, "efuse-uid", b->efuse_uid);
+     }
+     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
++    b->sysctl = dev;
+     memory_region_add_subregion_overlap(sysmem, 0x08000000,
+             sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0), -1000);
+ 
+@@ -1045,6 +1080,23 @@ flash_done:
+                            spi_irq(b, b->soc->pcie_irq));
+     }
+ 
++    /*
++     * Front panel LEDs.  PWM controller at 0x10048000 on all three SoCs;
++     * its channel register blocks differ (Linux pwm-mediatek)
++     */
++    {
++        RouterLedsHw hw = {
++            .pinctrl = pinctrl, .eth = b->eth, .sysctl = b->sysctl,
++            .nspi = b->soc->nspi, .pwm_base = 0x10048000,
++            .pwm_chan_base = b->soc->chip_id == 0x7981 ? 0x80 :
++                             b->soc->chip_id == 0x7987 ? 0x100 : 0x10,
++            .pwm_chan_width = b->soc->chip_id == 0x7987 ? 0x100 : 0x40,
++        };
++        memcpy(hw.spi, spi, sizeof(hw.spi));
++        b->leds = router_leds_new(b->led_def, MAX_LEDS, &hw, b->gpio_log,
++                                  &error_fatal);
++    }
++
+     qemu_register_reset(brom_reset, b);
+ }
+ 
+@@ -1291,6 +1343,20 @@ static void router_class_init(ObjectClass *oc, const void *data)
+     mc->no_floppy = 1;
+     mc->no_parallel = 1;
+ 
++    for (int i = 0; i < MAX_LEDS; i++) {
++        g_autofree char *name = g_strdup_printf("led%d", i + 1);
++        object_class_property_add(oc, name, "str", router_get_led,
++                                  router_set_led, NULL, (void *)(uintptr_t)i);
++        object_class_property_set_description(oc, name,
++            "front panel LED: \"<name>: <colour> <source>[ + <colour> "
++            "<source>...]\", source gpio:N[:low], phy:ADDR:N, "
++            "ws2812:BUS:N or pwm:N");
++    }
++    object_class_property_add_str(oc, "led-state", router_get_led_state,
++                                  NULL);
++    object_class_property_set_description(oc, "led-state",
++        "LED states, ';' per LED, ',' per colour: 0, 1, b (blinking), "
++        "#rrggbb");
+     object_class_property_add_str(oc, "pcie-wifi", router_get_pcie_wifi,
+                                   router_set_pcie_wifi);
+     object_class_property_set_description(oc, "pcie-wifi",
+diff --git a/hw/arm/mt7981/mt7981_sysctl.c b/hw/arm/mt7981/mt7981_sysctl.c
+index 978a0a1..2258e1f 100644
+--- a/hw/arm/mt7981/mt7981_sysctl.c
++++ b/hw/arm/mt7981/mt7981_sysctl.c
+@@ -284,6 +284,14 @@ static bool dramc_nao_read(MT7981SysctlState *s, hwaddr a, uint32_t *v)
+     return true;
+ }
+ 
++/* a register as last written (LED panel: PWM controller) */
++uint32_t mt7981_sysctl_peek(DeviceState *dev, hwaddr a)
++{
++    MT7981SysctlState *s = MT7981_SYSCTL(dev);
++
++    return reg_get(s, a & ~3, reg_default(s, a & ~3));
++}
++
+ static uint64_t sysctl_read(void *opaque, hwaddr offset, unsigned size)
+ {
+     MT7981SysctlState *s = opaque;
+diff --git a/hw/arm/mt7981/ws2812b.c b/hw/arm/mt7981/ws2812b.c
+new file mode 100644
+index 0000000..312f1e7
+--- /dev/null
++++ b/hw/arm/mt7981/ws2812b.c
+@@ -0,0 +1,150 @@
++/*
++ * WS2812B RGB LED chain on a SPI bus, as driven by OpenWrt's
++ * leds-ws2812b (e.g. the Xiaomi Redmi AX6000 front LEDs): every data bit
++ * is a 3-bit SPI pattern 1x0 (x = the bit), a transfer starts with zero
++ * bytes (the "reset" pulse) followed by 3 bytes of pattern per colour
++ * byte, 3 colour bytes per LED.  Only the decoded colours are kept, for
++ * the LED panel.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "hw/ssi/ssi.h"
++#include "mt7981.h"
++
++#define WS_MAX_LEDS     16
++
++OBJECT_DECLARE_SIMPLE_TYPE(Ws2812bState, WS2812B_SPI)
++
++struct Ws2812bState {
++    SSIPeripheral parent_obj;
++    uint8_t part[3];            /* SPI bytes of the colour byte being sent */
++    int npart;
++    int n;                      /* colour bytes since the reset pulse */
++    uint8_t rgb[WS_MAX_LEDS][3];
++    uint8_t lit[WS_MAX_LEDS][3];    /* last colour that was not black */
++    uint32_t changes[WS_MAX_LEDS];  /* on <-> off (LED panel: blinking) */
++    bool seen[WS_MAX_LEDS];
++};
++
++/*
++ * LED idx: its three colour bytes in the order sent (false: never set),
++ * the last colour other than black and the count of on/off changes
++ */
++bool ws2812b_get(DeviceState *dev, int idx, uint8_t rgb[3], uint8_t lit[3],
++                 uint32_t *changes)
++{
++    Ws2812bState *s = WS2812B_SPI(dev);
++
++    if (idx < 0 || idx >= WS_MAX_LEDS) {
++        return false;
++    }
++    memcpy(rgb, s->rgb[idx], 3);
++    memcpy(lit, s->lit[idx], 3);
++    *changes = s->changes[idx];
++    return s->seen[idx];
++}
++
++static void ws2812b_set(Ws2812bState *s, int n, uint8_t v)
++{
++    uint8_t *c = s->rgb[n / 3];
++    bool was_on = c[0] | c[1] | c[2];
++
++    c[n % 3] = v;
++    s->seen[n / 3] = true;
++    /* the LED's last byte completes its colour */
++    if (n % 3 == 2) {
++        bool on = c[0] | c[1] | c[2];
++        if (on) {
++            memcpy(s->lit[n / 3], c, 3);
++        }
++        if (on != was_on) {
++            s->changes[n / 3]++;
++        }
++    }
++}
++
++/*
++ * Encoded data never contains a zero byte (every bit starts with a 1), so
++ * a zero byte is the reset pulse: the next colour byte is LED 0's first.
++ * Linux's spi-mt65xx keeps CS asserted between transfers (pause mode), so
++ * CS does not mark the frames.
++ */
++static uint32_t ws2812b_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    Ws2812bState *s = WS2812B_SPI(dev);
++    uint32_t bits;
++    uint8_t v = 0;
++
++    if ((val & 0xff) == 0) {
++        s->npart = 0;
++        s->n = 0;
++        return 0;
++    }
++    s->part[s->npart++] = val;
++    if (s->npart < 3) {
++        return 0;
++    }
++    s->npart = 0;
++    bits = s->part[0] << 16 | s->part[1] << 8 | s->part[2];
++    for (int b = 0; b < 8; b++) {
++        v = v << 1 | ((bits >> (22 - 3 * b)) & 1);
++    }
++    if (s->n < WS_MAX_LEDS * 3) {
++        ws2812b_set(s, s->n++, v);
++    }
++    return 0;
++}
++
++static int ws2812b_set_cs(SSIPeripheral *dev, bool select)
++{
++    Ws2812bState *s = WS2812B_SPI(dev);
++
++    s->npart = 0;
++    s->n = 0;
++    return 0;
++}
++
++static void ws2812b_realize(SSIPeripheral *dev, Error **errp)
++{
++}
++
++static void ws2812b_reset(DeviceState *dev)
++{
++    Ws2812bState *s = WS2812B_SPI(dev);
++
++    s->npart = s->n = 0;
++    memset(s->rgb, 0, sizeof(s->rgb));
++    memset(s->lit, 0, sizeof(s->lit));
++    memset(s->changes, 0, sizeof(s->changes));
++    memset(s->seen, 0, sizeof(s->seen));
++}
++
++static void ws2812b_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = ws2812b_realize;
++    k->transfer = ws2812b_transfer;
++    k->set_cs = ws2812b_set_cs;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, ws2812b_reset);
++    dc->desc = "WS2812B RGB LED chain (SPI)";
++}
++
++static const TypeInfo ws2812b_info = {
++    .name = TYPE_WS2812B_SPI,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(Ws2812bState),
++    .class_init = ws2812b_class_init,
++};
++
++static void ws2812b_register_types(void)
++{
++    type_register_static(&ws2812b_info);
++}
++
++type_init(ws2812b_register_types)
+-- 
+2.47.3
+

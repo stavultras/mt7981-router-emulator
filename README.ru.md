@@ -70,10 +70,25 @@ Windows: скачайте zip из релиза (или соберите сам�
 | `reset-active-high`, `wps-active-high` | `on` | кнопка читается как 1 при нажатии (по умолчанию active low) |
 | `reset-hold` | мс | включение с зажатым reset (TFTP recovery в U-Boot) |
 | `poweroff` | `stop` · `reboot` | `stop` (по умолчанию): эмулятор завершается, когда Linux выключается («reboot: Power down» в UART0); `reboot`: как настоящая плата, прошивка которой не умеет выключаться |
-| `gpio-log` | `on` | печать изменений выходов GPIO (светодиоды) |
+| `gpio-log` | `on` | печать изменений выходов GPIO и состояний светодиодов |
+| `led1` … `led32` | `ИМЯ: ЦВЕТ ИСТОЧНИК [+ ЦВЕТ ИСТОЧНИК…]` | светодиоды передней панели (см. ниже); `led-state` (QOM `/machine`) отдаёт их состояние |
 | `efuse` | файл | загрузить содержимое eFuse из дампа настоящей платы (до 4 КБ, как читается из `/sys/bus/nvmem/devices/nvmem0/nvmem`), чтобы калибровки и данные чипа совпадали с этой платой |
 | `efuse-uid` | 32 hex-цифры | задать уникальный блок чипа, чтобы несколько эмулированных плат не были одинаковыми |
 | `nand-uid` | 32 hex-цифры | уникальный ID SPI-NAND (по умолчанию выводится из имени папки флеша); стоковая прошивка Cudy проверяет уникальный ID NAND, без него вход в веб-интерфейс закрыт |
+
+Светодиоды передней панели: `led1=Status: red gpio:11:low + white gpio:10:low` —
+одна лампа двух цветов, у каждого цвета свой GPIO (`:low` = GPIO_ACTIVE_LOW).
+Источники: `gpio:N[:low]` (GPIO SoC), `phy:ADDR:N` (вывод LED N у Ethernet
+PHY с адресом MDIO ADDR, как его запрограммировали регистры LED: RTL8221B,
+GPY211; например, лампа WAN у WR3000P в актуальном OpenWrt), `ws2812:BUS:N`
+(цепочка RGB WS2812B на шине SPI BUS, цвет `rgb`: Redmi AX6000) и `pwm:N`
+(канал PWM, pwm-leds: BPi-R4 Lite). QEMU опрашивает их каждые 50 мс;
+`qom-get /machine led-state` выдаёт по каждой лампе (`;`) и цвету (`,`)
+`0`, `1`, `b` (мигает) или `#rrggbb` / `b#rrggbb`. Windows-лаунчер
+показывает их рядом лампочек над консолью; с `-g` (`gpio-log=on`) QEMU
+печатает каждое изменение («LED Status: white on»).
+[`tools/dts-leds.py`](tools/dts-leds.py) заполняет ключи `led` пресетов из
+device tree OpenWrt (`--write --all`).
 
 Сетевые порты — netdev QEMU с id из таблицы (`wan`, `lan1`, …).
 Ключи пресета только для лаунчеров: `lan-ip` (адрес роутера в LAN, по
@@ -224,6 +239,7 @@ tools/prepare-nand.sh --emmc --emmc-layout wh3000-pro --uboot cmcc_rax3000m-emmc
 | Коммутатор | `mt7981_eth.c` | MT7531: страничный доступ по MDIO, косвенный доступ к PHY, special tag MTK (DSA), FDB с обучением, port matrix, IRQ линка → EINT 38 |
 | PHY | `mt7981_eth.c` | 5× GPHY MT7531; RTL8221B-VB-CG (C45, термодатчик); Motorcomm YT8821 (расширенные регистры, пространства UTP/SerDes, статус 2.5G); MaxLinear GPY211C (C45, версия прошивки, mailbox, термодатчик); встроенный GbE PHY MT7981 (с калибровкой); PHY на порту 5 MT7531; необязательные GPIO аппаратного сброса |
 | GPIO / EINT | `mt7981_pinctrl.c` | кнопки (reset/WPS, `reset-hold-ms` для нажатия на время), лог светодиодов, уровни выводов для других устройств |
+| Светодиоды | `mt7981_leds.c`, `ws2812b.c` | светодиоды передней панели из пресета: GPIO, регистры LED у PHY (RTL8221B, GPY211), WS2812B на SPI, каналы PWM; распознавание мигания; `led-state` |
 | USB | xHCI из QEMU + IPPC MTK | разъём USB 2.0 / 3.0 |
 | Wi-Fi | `mt7981_wmac.c` | кольца WFDMA + эмуляция командного интерфейса прошивок WM/WA: прошивка грузится, оба диапазона поднимаются, hostapd работает, в эфире ничего нет (сканирование пустое) |
 | PCIe (MT7987) | `mt7987_pcie.c` | хост MediaTek Gen3: линк, TLP конфигурации через CFGNUM, INTx, приём MSI; корневой порт из QEMU |
@@ -264,7 +280,7 @@ Linux: [`emulator.sh`](emulator.sh) — `-P ПРЕСЕТ` (`-P list`), `-o ПА�
 DHCP работает, наружу ничего не уходит), `-l isolated|nic|user|none` (`user` — только этот
 ПК, пробросы из пресета), `-p "1 3"` (порты LAN),
 `-u ПАПКА` (USB-флешка из папки, FAT16), `-L ПАПКА` (логи консоли),
-`-g` (лог GPIO), `-R` (включение с зажатым reset на 10 с → TFTP recovery),
+`-g` (лог GPIO и светодиодов), `-R` (включение с зажатым reset на 10 с → TFTP recovery),
 `-d` (лог неэмулированных регистров), `-S СОКЕТ` (без терминала: консоль
 на unix-сокете, для скриптов и CI; подключиться —
 `socat -,raw,echo=0,escape=0x1d UNIX-CONNECT:СОКЕТ`). Переменные окружения `WAN_EXTRA` /
