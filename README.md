@@ -331,7 +331,8 @@ built-in ones, and runs hostapd on it like on real hardware.
    `radio1` can be disabled, they are not on the air anyway.
 
 Checked with a Ralink RT5370 (148f:5370) on a Cudy WR3000P with OpenWrt
-25.12.5: AP on channel 6, WPA2, bridged to br-lan.
+25.12.5: AP on channel 6, WPA2, bridged to br-lan; on Linux and on
+Windows 11 with UsbDk.
 
 ## Repository layout
 
