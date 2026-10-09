@@ -25,7 +25,7 @@ Debian / Ubuntu:
 ```bash
 sudo apt-get install -y build-essential git ninja-build meson pkg-config \
     python3 python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev \
-    libfdt-dev zlib1g-dev \
+    libfdt-dev libusb-1.0-0-dev zlib1g-dev \
     mtd-utils gdisk wget u-boot-tools device-tree-compiler socat \
     bridge-utils iproute2 iptables libpcap0.8t64
 ```
@@ -37,7 +37,7 @@ Fedora:
 ```bash
 sudo dnf install -y gcc make git ninja-build meson pkgconf-pkg-config \
     python3 glib2-devel pixman-devel libslirp-devel libfdt-devel \
-    zlib-ng-compat-devel \
+    libusb1-devel zlib-ng-compat-devel \
     mtd-utils-ubi gdisk wget uboot-tools dtc socat \
     iproute iptables-nft libpcap
 ```
@@ -46,7 +46,7 @@ Arch Linux:
 
 ```bash
 sudo pacman -S --needed base-devel git ninja meson python glib2 pixman \
-    libslirp dtc zlib \
+    libslirp dtc libusb zlib \
     mtd-utils gptfdisk wget uboot-tools socat iproute2 iptables libpcap
 ```
 

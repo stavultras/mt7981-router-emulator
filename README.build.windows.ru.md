@@ -41,7 +41,7 @@ VERSION=snapshot ./build-windows.sh   # другая версия OpenWrt
    которых они зависят (рекурсивно по `objdump -p`), и делает всем
    `strip --strip-all`;
 4. компилирует лаунчер (`windows/Launcher.cs`, `windows/Presets.cs`,
-   `windows/Lang.cs`, `windows/Terminal.cs`, `windows/Leds.cs` и `work/Version.cs`, сгенерированный из [`VERSION`](VERSION))
+   `windows/Lang.cs`, `windows/Terminal.cs`, `windows/Leds.cs`, `windows/UsbDevices.cs` и `work/Version.cs`, сгенерированный из [`VERSION`](VERSION))
    **против эталонных сборок .NET Framework 4.8** — в библиотеках Mono есть
    более новые методы, которые на Windows дали бы `MissingMethodException`;
 5. копирует [`presets/`](presets/), [`languages/`](languages/) и для каждого пресета собирает папку NAND
@@ -111,7 +111,7 @@ Mono, а не на .NET Framework.
 
 - Лаунчер: достаточно компилятора C#, входящего в .NET Framework (код
   совместим с C# 5):
-  `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /out:emulator.exe Launcher.cs Presets.cs Lang.cs Terminal.cs Leds.cs Version.cs`
+  `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /r:System.Management.dll /out:emulator.exe Launcher.cs Presets.cs Lang.cs Terminal.cs Leds.cs UsbDevices.cs Version.cs`
   (`Version.cs` генерирует `build-windows.sh` из [`VERSION`](VERSION): там `RouterEmulator.AppVersion.Text` и версия сборки)
 - QEMU: окружение MSYS2 CLANG64 с обычными зависимостями QEMU, затем те же
   параметры `configure`, что выше (без `--cross-prefix`).

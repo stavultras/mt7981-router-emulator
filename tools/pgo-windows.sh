@@ -54,10 +54,12 @@ mkdir -p /src/build-win-pgo-$STAGE && cd /src/build-win-pgo-$STAGE
     --cc="clang $CLANG" --cxx="clang++ $CLANG" --extra-cflags="$PF" \
     --extra-ldflags="-L$GCCLIB $PL" \
     --target-list=aarch64-softmmu --enable-slirp --enable-fdt=internal \
+    --enable-libusb \
     --disable-docs --disable-werror --disable-gtk --disable-sdl \
     --disable-vnc --disable-spice --disable-opengl --disable-curl \
     --disable-guest-agent --disable-tools >configure.out 2>&1 ||
     { tail -20 configure.out; exit 1; }
+grep -q "CONFIG_USB_LIBUSB 1" config-host.h || ./pyvenv/bin/meson configure -Dlibusb=enabled >/dev/null
 # re-read meson.build (new source files) even if build.ninja looks fresh
 ninja reconfigure >reconfigure.out 2>&1 || { tail -20 reconfigure.out; exit 1; }
 ninja >ninja.out 2>&1 || { grep -A10 FAILED ninja.out | head -40; exit 1; }'

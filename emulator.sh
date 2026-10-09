@@ -41,6 +41,10 @@
 #   -L DIR         console log folder (default: ./logs, "-L none" disables);
 #                  every start writes console_YYYY-MM-DD_HH-MM-SS.log
 #   -m MONITOR     QEMU monitor socket path (default: ./work/monitor.sock)
+#   -o "usb-host=VID:PID[;VID:PID...]"  pass USB devices of this PC (e.g. a
+#                  Wi-Fi dongle, 148f:5370) through to the router, on USB
+#                  2.0 root ports 2, 3, ... (OpenWrt needs their drivers,
+#                  e.g. kmod-rt2800-usb)
 #   -g             print GPIO changes and the front panel LEDs of the preset
 #                  ("LED Status: white on"; preset keys led1=...)
 #   -R             power on with reset held 10 s (U-Boot TFTP recovery:
@@ -236,6 +240,21 @@ if [ -n "$CONSOCK" ]; then
     [ -n "$LOG" ] && c="$c,logfile=${LOG//,/,,},logappend=off"
     CON=(-monitor "unix:$MON,server,nowait" -chardev "$c" -serial chardev:con)
 fi
+
+# usb-host=VID:PID[;VID:PID...] (preset or -o): QEMU opens the device nodes
+UHS=$(printf '%s\n' "${MOPTS//,/$'\n'}" | sed -n 's/^usb-host=//p' | tail -1)
+for UH in ${UHS//;/ }; do
+    found=
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" = "${UH,,}" ] || continue
+        node=$(printf '/dev/bus/usb/%03d/%03d' "$(cat "$d/busnum")" "$(cat "$d/devnum")")
+        [ -w "$node" ] || echo "usb-host: no write access to $node; e.g. a udev rule:" \
+            "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"${UH%%:*}\", ATTR{idProduct}==\"${UH#*:}\", MODE=\"0666\"" \
+            "in /etc/udev/rules.d/70-router-emulator.rules, then replug the device" >&2
+        found=1
+    done
+    [ -n "$found" ] || echo "usb-host: device $UH is not plugged in" >&2
+done
 
 rm -f "$MON"
 "$QEMU" -M "$SOC-router,nand-dir=${NAND//,/,,}$MOPTS$GPIO" -m "${RAM}M" \

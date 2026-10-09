@@ -1,0 +1,159 @@
+From 9ff7bdb981b11756d0ff690bdd090ee0729a7f46 Mon Sep 17 00:00:00 2001
+From: Dmitry Mostovoy <stavultras@gmail.com>
+Date: Fri, 9 Oct 2026 13:31:39 -0400
+Subject: [PATCH 23/23] hw/arm/mt7981: USB pass-through of host devices
+ (usb-host=VID:PID)
+
+Machine option usb-host=VID:PID[;VID:PID...]: devices of the host (e.g.
+a USB Wi-Fi dongle) are attached with usb-host on USB 2.0 root ports 2,
+3, ... of the xHCI, also on boards without a USB connector.  The ports
+are fixed so the sysfs paths in OpenWrt's wireless config (1-2:1.0) do
+not depend on the board or on a USB stick on port 1.
+
+Windows: libusb uses the UsbDk backend when UsbDk is installed, so a
+device keeps its Windows driver and is taken over only while QEMU uses
+it; otherwise libusb needs WinUSB bound to the device.
+
+Checked with a Ralink RT5370 (148f:5370) on a Cudy WR3000P running
+OpenWrt 25.12.5 with kmod-rt2800-usb: access point on channel 6, WPA2,
+up again after a reboot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/arm/mt7981/mt7981_router.c | 67 +++++++++++++++++++++++++++++++++--
+ hw/usb/host-libusb.c          |  8 +++++
+ 2 files changed, 73 insertions(+), 2 deletions(-)
+
+diff --git a/hw/arm/mt7981/mt7981_router.c b/hw/arm/mt7981/mt7981_router.c
+index 3e3ba15..d8e7a80 100644
+--- a/hw/arm/mt7981/mt7981_router.c
++++ b/hw/arm/mt7981/mt7981_router.c
+@@ -230,6 +230,7 @@ struct RouterState {
+     char *nor_id;               /* JEDEC ID, 6 hex digits */
+     uint32_t ddr;               /* 3 or 4 */
+     uint32_t usb;               /* 0 = none, 2 = USB 2.0, 3 = USB 3.0 */
++    char *usb_host;             /* passed through host devices VID:PID;... */
+     uint32_t reset_gpio, wps_gpio;
+     bool reset_active_high, wps_active_high;
+ 
+@@ -823,6 +824,9 @@ static void router_init(MachineState *machine)
+     DeviceState *pinctrl;
+     MemoryRegion *sysmem = get_system_memory();
+     DeviceState *dev, *spi[3] = { NULL };
++    uint32_t usb2;
++    char **hosts;
++    int nhost;
+     DriveInfo *dinfo;
+     uint64_t ram_size = machine->ram_size;
+ 
+@@ -1039,13 +1043,53 @@ flash_done:
+      */
+     dev = qdev_new(TYPE_XHCI_SYSBUS);
+     qdev_prop_set_uint32(dev, "slots", 32);
+-    qdev_prop_set_uint32(DEVICE(&XHCI_SYSBUS(dev)->xhci), "p2",
+-                         b->usb ? 1 : 0);
++    /*
++     * usb-host=VID:PID[;VID:PID...]: devices of the host (e.g. a USB Wi-Fi
++     * dongle) on USB 2.0 root ports 2, 3, ..., also on boards without a
++     * connector (the SoC's controller is there).  Fixed ports, so their
++     * sysfs paths (1-2, ... in OpenWrt's wireless config) do not depend
++     * on the board.
++     */
++    hosts = g_strsplit_set(b->usb_host ? b->usb_host : "", "; ", -1);
++    nhost = 0;
++    for (int i = 0; hosts[i]; i++) {
++        nhost += *hosts[i] != 0;
++    }
++    usb2 = nhost ? 1 + nhost : b->usb ? 1 : 0;
++    qdev_prop_set_uint32(DEVICE(&XHCI_SYSBUS(dev)->xhci), "p2", usb2);
+     qdev_prop_set_uint32(DEVICE(&XHCI_SYSBUS(dev)->xhci), "p3",
+                          b->usb == 3 ? 1 : 0);
+     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, 0x11200000);
+     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, spi_irq(b, 173));
++    if (nhost && !object_class_by_name("usb-host")) {
++        error_report("usb-host: this QEMU is built without USB "
++                     "pass-through (libusb)");
++        exit(1);
++    }
++    for (int i = 0, n = 0; hosts[i]; i++) {
++        unsigned vid, pid;
++        DeviceState *host;
++        g_autofree char *port = NULL;
++
++        if (!*hosts[i]) {
++            continue;
++        }
++        if (sscanf(hosts[i], "%x:%x", &vid, &pid) != 2 ||
++            vid > 0xffff || pid > 0xffff) {
++            error_report("usb-host: \"%s\": expected VID:PID (hex), e.g. "
++                         "148f:5370", hosts[i]);
++            exit(1);
++        }
++        port = g_strdup_printf("%d", 2 + n++);
++        host = qdev_new("usb-host");
++        qdev_prop_set_uint32(host, "vendorid", vid);
++        qdev_prop_set_uint32(host, "productid", pid);
++        qdev_prop_set_string(host, "port", port);
++        qdev_realize_and_unref(host, BUS(&XHCI_SYSBUS(dev)->xhci.bus),
++                               &error_fatal);
++    }
++    g_strfreev(hosts);
+     dev = qdev_new(TYPE_MT7981_SYSCTL);
+     qdev_prop_set_uint64(dev, "base", 0x11203e00);
+     qdev_prop_set_uint64(dev, "size", 0x100);
+@@ -1194,6 +1238,19 @@ static void router_set_ports(Object *obj, const char *value, Error **errp)
+     b->ports = g_strdup(value);
+ }
+ 
++static char *router_get_usb_host(Object *obj, Error **errp)
++{
++    return g_strdup(ROUTER_MACHINE(obj)->usb_host ?: "");
++}
++
++static void router_set_usb_host(Object *obj, const char *value, Error **errp)
++{
++    RouterState *b = ROUTER_MACHINE(obj);
++
++    g_free(b->usb_host);
++    b->usb_host = *value ? g_strdup(value) : NULL;
++}
++
+ static char *router_get_usb(Object *obj, Error **errp)
+ {
+     uint32_t u = ROUTER_MACHINE(obj)->usb;
+@@ -1474,6 +1531,12 @@ static void router_class_init(ObjectClass *oc, const void *data)
+     object_class_property_add_str(oc, "ddr", router_get_ddr, router_set_ddr);
+     object_class_property_set_description(oc, "ddr",
+         "DRAM type: ddr3 or ddr4 (must match the preloader); size is -m");
++    object_class_property_add_str(oc, "usb-host", router_get_usb_host,
++                                  router_set_usb_host);
++    object_class_property_set_description(oc, "usb-host",
++        "VID:PID of host USB devices (e.g. a Wi-Fi dongle), ';' separated, "
++        "passed through to the router on USB 2.0 root ports 2, 3, ... "
++        "(needs libusb; Windows: UsbDk or the WinUSB driver)");
+     object_class_property_add_str(oc, "usb-port", router_get_usb, router_set_usb);
+     object_class_property_set_description(oc, "usb-port",
+         "USB connector: none, 2 (USB 2.0) or 3 (USB 3.0)");
+diff --git a/hw/usb/host-libusb.c b/hw/usb/host-libusb.c
+index b74670a..09d0995 100644
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -293,6 +293,14 @@ static int usb_host_init(void)
+     if (rc != 0) {
+         return -1;
+     }
++#if defined(CONFIG_WIN32) && LIBUSB_API_VERSION >= 0x01000106
++    /*
++     * With UsbDk installed, devices are taken over from their Windows
++     * driver only while QEMU uses them; without it this fails and libusb
++     * needs the WinUSB driver bound to the device (e.g. with Zadig).
++     */
++    libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK);
++#endif
+ #if LIBUSB_API_VERSION >= 0x01000106
+     libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, loglevel);
+ #else
+-- 
+2.47.3
+

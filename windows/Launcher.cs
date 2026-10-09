@@ -9,7 +9,7 @@
 //
 // Build: see build-windows.sh (mcs against the .NET Framework 4.8
 // reference assemblies), or with csc.exe on Windows:
-//   csc -target:winexe -out:emulator.exe Launcher.cs Presets.cs Lang.cs Terminal.cs Leds.cs Version.cs
+//   csc -target:winexe -out:emulator.exe Launcher.cs Presets.cs Lang.cs Terminal.cs Leds.cs UsbDevices.cs Version.cs
 
 using System;
 using System.Collections.Generic;
@@ -42,7 +42,10 @@ namespace RouterEmulator
         Button btnEdit;
         TextBox nand, usb, logs;
         CheckBox useUsb, gpioLog, useLogs;
-        Button nandBrowse, usbBrowse, logsBrowse;
+        Button nandBrowse, usbBrowse, logsBrowse, usbDevRefresh;
+        TextBox usbDev;
+        // passed through USB devices: "vid:pid" -> name
+        List<KeyValuePair<string, string>> usbDevs = new List<KeyValuePair<string, string>>();
         Button start, btnFactory, btnWps, btnPower, btnTftp, btnNew, btnTerm;
         // buttons held for 10 s: locked, counting down on their text
         readonly HashSet<Button> counting = new HashSet<Button>();
@@ -159,6 +162,25 @@ namespace RouterEmulator
             usbBrowse = AddBrowse(usb, y);
             y += 34;
 
+            // USB devices of this PC (e.g. a Wi-Fi dongle) passed through to the router
+            AddLabel("main.usb_dev", "USB devices:", y);
+            usbDev = new TextBox { Left = 130, Top = y, Width = 380, ReadOnly = true };
+            Controls.Add(usbDev);
+            usbDevRefresh = new Button { Left = 516, Top = y - 1, Width = 84, Height = 25 };
+            Tr(usbDevRefresh, "main.choose", "Choose...");
+            usbDevRefresh.Click += delegate {
+                using (var f = new UsbDevForm(usbDevs)) {
+                    if (f.ShowDialog(this) == DialogResult.OK) { usbDevs = f.Result; ShowUsbDevs(); }
+                }
+            };
+            Controls.Add(usbDevRefresh);
+            y += 24;
+            var usbDevHint = new Label { Left = 130, Top = y, Width = 470, Height = 32, ForeColor = Color.DimGray };
+            Tr(usbDevHint, "main.usb_dev_hint", "Passed through to the router (e.g. a Wi-Fi dongle, OpenWrt "
+                + "needs its driver). Needs UsbDk (github.com/daynix/UsbDk) or the WinUSB driver.");
+            Controls.Add(usbDevHint);
+            y += 38;
+
             useLogs = new CheckBox { Left = 14, Top = y, Width = 115 };
             Tr(useLogs, "main.logs", "Log folder:");
             Controls.Add(useLogs);
@@ -239,6 +261,13 @@ namespace RouterEmulator
             useLogs.CheckedChanged += delegate { UpdateFolders(); };
             UpdateFolders();
             gpioLog.Checked = Get("gpiolog", "0") == "1";
+            foreach (var d in Get("usbdev", "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)) {
+                int eq = d.IndexOf('=');
+                usbDevs.Add(eq > 0 ? new KeyValuePair<string, string>(d.Substring(0, eq), d.Substring(eq + 1))
+                                   : new KeyValuePair<string, string>(d, d));
+            }
+            ShowUsbDevs();
+            relang.Add(ShowUsbDevs);
             Select(wan, Get("wan", "nat"));
             Select(lan, Get("lan", "host"));
             FormClosing += (o, e) => {
@@ -475,6 +504,7 @@ namespace RouterEmulator
             var args = new List<string> {
                 "-M", b.Machine + ",nand-dir=" + Esc(nand.Text) + b.MachineOptions(root)
                       + (gpioLog.Checked ? ",gpio-log=on" : "")
+                      + (usbDevs.Count > 0 ? ",usb-host=" + string.Join(";", usbDevs.ConvertAll(d => d.Key).ToArray()) : "")
                       + (resetHoldMs > 0 ? ",reset-hold=" + resetHoldMs : ""),
                 "-m", b.RamMB + "M",
                 "-display", "none",
@@ -527,6 +557,10 @@ namespace RouterEmulator
                 RedirectStandardOutput = true,
                 WorkingDirectory = Path.Combine(root, "qemu"),
             };
+            // libusb loads UsbDkHelper.dll from the PATH
+            string usbdk = UsbDkDir();
+            if (usbdk != null)
+                psi.EnvironmentVariables["PATH"] = usbdk + ";" + Environment.GetEnvironmentVariable("PATH");
             var qemuErr = new StringBuilder();
             try {
                 qemu = Process.Start(psi);
@@ -724,6 +758,7 @@ namespace RouterEmulator
             btnFactory.Enabled = on && !counting.Contains(btnFactory);
             btnTftp.Enabled = !on && !counting.Contains(btnTftp);
             board.Enabled = wan.Enabled = lan.Enabled = useUsb.Enabled = gpioLog.Enabled = !on;
+            usbDev.Enabled = usbDevRefresh.Enabled = !on;
             btnEdit.Enabled = btnNew.Enabled = !on;
             useLogs.Enabled = !on;
             if (!on) OnBoardChanged();
@@ -781,6 +816,24 @@ namespace RouterEmulator
             }
         }
 
+        void ShowUsbDevs()
+        {
+            usbDev.Text = usbDevs.Count == 0 ? L.T("main.usb_dev_none", "None")
+                : string.Join(", ", usbDevs.ConvertAll(d => d.Value).ToArray());
+        }
+
+        // UsbDk's runtime library (installed by its MSI), null if missing
+        static string UsbDkDir()
+        {
+            foreach (var pf in new[] { Environment.GetEnvironmentVariable("ProgramW6432"),
+                                       Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) }) {
+                if (string.IsNullOrEmpty(pf)) continue;
+                string d = Path.Combine(pf, "UsbDk Runtime Library");
+                if (File.Exists(Path.Combine(d, "UsbDkHelper.dll"))) return d;
+            }
+            return null;
+        }
+
         void Error(string msg)
         {
             MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -818,6 +871,7 @@ namespace RouterEmulator
                     "logs=" + logs.Text,
                     "uselogs=" + (useLogs.Checked ? "1" : "0"),
                     "gpiolog=" + (gpioLog.Checked ? "1" : "0"),
+                    "usbdev=" + string.Join(";", usbDevs.ConvertAll(d => d.Key + "=" + d.Value.Replace(";", ",")).ToArray()),
                     "wan=" + Key((NetChoice)wan.SelectedItem),
                     "lan=" + Key((NetChoice)lan.SelectedItem),
                     "lang=" + (language.SelectedItem != null ? Path.GetFileName(((LangInfo)language.SelectedItem).FilePath) : ""),

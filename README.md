@@ -63,6 +63,7 @@ or use dumps of a real router.
 | `nor`, `nor-id` | MB (16), JEDEC ID (`ef4018`) | SPI-NOR size and ID, e.g. `204018` = XMC XM25QH128C, `c84018` = GD25Q128; `nor=64,nor-id=ef4020` = Winbond W25Q512JV (64 MB, 4-byte addressing; e.g. a WR3000 with a bigger chip) |
 | `ddr` | `ddr3` · `ddr4` | soldered DRAM type: a BL2 built for the other type stops the machine, as DRAM init fails on a real board |
 | `usb-port` | `none` · `2` · `3` | USB connector (USB 3.0: devices attach at SuperSpeed) |
+| `usb-host` | `VID:PID[;VID:PID…]` | pass USB devices of this PC through to the router (USB 2.0 root ports 2, 3, …, also on boards without a connector), e.g. a Wi-Fi dongle, an LTE modem, a USB Ethernet adapter; see "USB Wi-Fi dongle" |
 | `pcie-wifi` | `none` · `mt7992` | MT7987 only: card in the PCIe slot. `mt7992` = MediaTek MT7992 Wi-Fi 7 (2.4 + 5 GHz); OpenWrt drives it with `kmod-mt7996e` and the firmware of `kmod-mt7992-firmware`, which official MT7987 images do not include |
 | `reset-gpio`, `wps-gpio` | GPIO | buttons (QOM `/machine/pinctrl` `reset-button`, `wps-button`) |
 | `reset-active-high`, `wps-active-high` | `on` | button reads 1 when pressed (default: active low) |
@@ -304,6 +305,33 @@ tty to the window), interface language switched on the fly
 ([`languages/*.ini`](languages/): English, Русский; add a language by
 copying `en.ini`; [`tools/gen-lang-en.py`](tools/gen-lang-en.py)
 regenerates `en.ini` from the sources, `--check` lists untranslated keys).
+
+## USB Wi-Fi dongle
+
+The emulated Wi-Fi radios are silent. For real Wi-Fi, pass a USB Wi-Fi
+dongle of this PC through to the router (`usb-host=VID:PID`, several
+`;` separated; Windows launcher: "USB devices" → Choose…); OpenWrt drives it with its own driver as one
+more radio (`radio2`, path `…/usb1/1-2/1-2:1.0`), next to the silent
+built-in ones, and runs hostapd on it like on real hardware.
+
+1. Linux: `./emulator.sh … -o usb-host=148f:5370` (QEMU built with
+   libusb: `libusb-1.0-0-dev`). QEMU opens `/dev/bus/usb/…`, so the user
+   needs write access (emulator.sh prints a udev rule otherwise); the
+   host's driver releases the dongle while the router uses it.
+   Windows: install [UsbDk](https://github.com/daynix/UsbDk/releases)
+   (the dongle stays on its Windows driver and is taken over only while
+   the router runs) or bind the WinUSB driver to it with Zadig.
+2. In OpenWrt install the dongle's driver once (WAN needs Internet), e.g.
+   Ralink RT5370 / RT3070: `apk add kmod-rt2800-usb rt2800-usb-firmware`;
+   MediaTek MT7601U: `kmod-mt7601u`; MT7612U: `kmod-mt76x2u`; Atheros
+   AR9271: `kmod-ath9k-htc`.
+3. Network → Wireless: enable `radio2` (the dongle's band: a 2.4 GHz
+   dongle gives 2.4 GHz; a dual-band one works in one band at a time —
+   choose 5 GHz there), set SSID and key. The built-in `radio0` /
+   `radio1` can be disabled, they are not on the air anyway.
+
+Checked with a Ralink RT5370 (148f:5370) on a Cudy WR3000P with OpenWrt
+25.12.5: AP on channel 6, WPA2, bridged to br-lan.
 
 ## Repository layout
 

@@ -23,10 +23,12 @@ $SUDO docker image inspect qemu-win64-cross >/dev/null 2>&1 ||
         -f src/qemu/tests/docker/dockerfiles/fedora-win64-cross.docker \
         src/qemu/tests/docker/dockerfiles
 # clang instead of MinGW GCC: native TLS (GCC uses slow emulated TLS,
-# about 30% slower guest execution); same MinGW libraries from Fedora
-if ! $SUDO docker image inspect qemu-win64-clang >/dev/null 2>&1; then
+# about 30% slower guest execution); same MinGW libraries from Fedora,
+# plus libusb for USB pass-through (usb-host=VID:PID)
+if ! $SUDO docker run --rm qemu-win64-clang test -f \
+        /usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/libusb-1.0.pc 2>/dev/null; then
     mkdir -p work
-    printf 'FROM qemu-win64-cross\nRUN dnf install -y clang lld && dnf clean all\n' > work/Dockerfile.clang
+    printf 'FROM qemu-win64-cross\nRUN dnf install -y clang lld mingw64-libusb1 && dnf clean all\n' > work/Dockerfile.clang
     $SUDO docker build -t qemu-win64-clang -f work/Dockerfile.clang work/
 fi
 APP=Router-Emulator
@@ -44,9 +46,12 @@ mkdir -p /src/build-win-clang && cd /src/build-win-clang
 [ -f build.ninja ] || ../configure --cross-prefix=x86_64-w64-mingw32- \
     --cc="clang $CLANG" --cxx="clang++ $CLANG" --extra-ldflags="-L$GCCLIB" \
     --target-list=aarch64-softmmu --enable-slirp --enable-fdt=internal \
+    --enable-libusb \
     --disable-docs --disable-werror --disable-gtk --disable-sdl \
     --disable-vnc --disable-spice --disable-opengl --disable-curl \
     --disable-guest-agent --disable-tools
+# build directories configured before libusb was added
+grep -q "CONFIG_USB_LIBUSB 1" config-host.h || ./pyvenv/bin/meson configure -Dlibusb=enabled
 ninja
 SR=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
 cp qemu-system-aarch64.exe /out/
@@ -77,8 +82,8 @@ EOF
 API=/usr/lib/mono/4.8-api
 mcs -nostdlib -noconfig -target:winexe -platform:anycpu -out:"$PKG/emulator.exe" \
     -r:$API/mscorlib.dll -r:$API/System.dll -r:$API/System.Core.dll \
-    -r:$API/System.Drawing.dll -r:$API/System.Windows.Forms.dll \
-    windows/Launcher.cs windows/Presets.cs windows/Lang.cs windows/Terminal.cs windows/Leds.cs work/Version.cs
+    -r:$API/System.Drawing.dll -r:$API/System.Windows.Forms.dll -r:$API/System.Management.dll \
+    windows/Launcher.cs windows/Presets.cs windows/Lang.cs windows/Terminal.cs windows/Leds.cs windows/UsbDevices.cs work/Version.cs
 cp windows/README.txt LICENSE "$PKG/"
 cp usb/README.txt "$PKG/usb/"
 mkdir -p "$PKG/logs"

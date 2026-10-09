@@ -133,6 +133,23 @@ The "USB folder" appears as a USB flash drive (FAT16, <= 500 MB) on the
 router's USB port (boards with USB only). In OpenWrt install
 kmod-usb-storage and kmod-fs-vfat, then: mount /dev/sda1 /mnt
 
+USB devices (Wi-Fi dongle, ...)
+-------------------------------
+"USB devices: Choose..." passes USB devices of this PC through to the
+router (any device OpenWrt has a driver for: a Wi-Fi dongle, an LTE
+modem, a USB Ethernet adapter, ...). With a USB Wi-Fi dongle OpenWrt
+runs a real access point (the emulator's built-in radios are silent).
+1. Install UsbDk (https://github.com/daynix/UsbDk/releases, x64 MSI):
+   the dongle stays on its Windows driver and is taken over only while
+   the router runs. (Without UsbDk: bind the WinUSB driver to it with
+   Zadig; Windows cannot use the dongle then.)
+2. Tick the dongle in "USB devices: Choose...", power on. In OpenWrt install its
+   driver once, e.g. Ralink RT5370 / RT3070:
+     apk update && apk add kmod-rt2800-usb rt2800-usb-firmware
+   (MT7601U: kmod-mt7601u, MT7612U: kmod-mt76x2u, AR9271: kmod-ath9k-htc)
+3. LuCI: Network -> Wireless: enable radio2 (the dongle), set SSID and
+   key. A dual-band dongle works in one band at a time: choose 5 GHz.
+
 Console logs
 ------------
 With "Log folder" ticked, every "Power on" writes the complete router
